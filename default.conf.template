@@ -1,0 +1,89 @@
+# If the X-Forwarded-Proto header sent by an upstream proxy is "https", our FORWARD_HOST should see "https".
+# This means that you have to be able to trust your upstream proxy!
+# Ideally it should run on the same secure network, like a docker network.
+map $http_x_forwarded_proto $final_scheme {
+    default $scheme;
+    https https;
+}
+
+server {
+  # Disable showing Nginx version
+  server_tokens off;
+
+  # Security headers
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+  # Configurable CSP with sane default in Dockerfile
+  add_header Content-Security-Policy "${CONTENT_SECURITY_POLICY}" always;
+
+  # Buffer sizes and timeouts configs for better robustness against DoS attacks
+  client_body_buffer_size ${MAX_BUFFER_SIZE};
+  client_header_buffer_size ${MAX_BUFFER_SIZE};
+  large_client_header_buffers 4 ${MAX_BUFFER_SIZE};
+  client_max_body_size ${CLIENT_MAX_BODY_SIZE}; #generous limit to enable file uploads
+  keepalive_timeout ${TIMEOUT_KEEPALIVE_CALC}s; #calculated in start.sh to be 5s above TIMEOUT
+  send_timeout ${TIMEOUT}s;
+  client_body_timeout ${TIMEOUT}s;
+  client_header_timeout ${TIMEOUT}s;
+  proxy_send_timeout ${TIMEOUT}s;
+  proxy_read_timeout ${TIMEOUT}s;
+  proxy_connect_timeout ${TIMEOUT}s;
+
+  listen 8080 default_server; 
+ 
+  set $sca_token "${SCA_TOKEN}";
+  set $sca_token_max_age 604800; # 7 days
+  
+  # Main location protected by the auth_request sub-request
+  location / {
+      auth_request /auth;
+
+      # If auth fails with 401, redirect to our auth_basic,
+      # where we set the cookie on successful password authentication.
+      error_page 401 = @do_auth_basic;
+      
+      # If auth succeeds proxy the request to the FORWARD_HOST
+      proxy_pass http://${FORWARD_HOST}:${FORWARD_PORT};
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $final_scheme;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+  }
+
+  # Internal location to perform the actual authentication check
+  location = /auth {
+      internal; # Can only be accessed by Nginx internally
+
+      # Check for the valid cookie
+      if ($cookie_sca_auth_token = $sca_token) {
+          # Cookie is valid, return 204 No Content (success)
+          return 204;
+      }
+
+      # Cookie is missing or invalid, return 401 Unauthorized
+      return 401;
+  }
+
+  # Internal location that handles the basic auth challenge and setting of the auth cookie
+  location @do_auth_basic {
+      internal;
+      auth_basic "Restricted Content";
+      auth_basic_user_file /etc/nginx/.htpasswd;
+
+      # Set auth cookie on successful basic auth
+      add_header Set-Cookie "sca_auth_token=$sca_token; max-age=$sca_token_max_age; path=/; SameSite=Strict; Secure; HttpOnly";
+
+      # Proxy the original request after successful basic auth
+      proxy_pass http://${FORWARD_HOST}:${FORWARD_PORT};
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $final_scheme;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";  
+    }
+}
